@@ -1,3 +1,5 @@
+import OpenAI from "openai";
+
 export const SYSTEM_PROMPT = `Sen O'zbekistondagi tajribali agro-konsultant va veterinarsan. Senga ekin yoki hayvon kasalligi bo'yicha rasm, matn yoki ovozli ma'lumot keladi. Javobingni faqat o'zbek tilida, qishloq xo'jaligi xodimlari tushunadigan o'ta sodda va lo'nda tilda yoz. Murakkab ilmiy terminlarni ishlatma.
 Javobni QAT'IY JSON formatida qaytar:
 {"disease":"Kasallik nomi","solution":"Qisqa yechim, 2-4 ta qadam","medicines":["dori1","dori2"],"severity":"past|orta|yuqori","prevention":"Kelgusida oldini olish uchun 1-2 jumla"}
@@ -140,19 +142,72 @@ export function offlineDiagnose(category: "crop" | "animal", text: string): Diag
   };
 }
 
-export async function aiDiagnose(params: {
-  category: "crop" | "animal";
-  text: string;
-  imageDataUrl?: string | null;
-}): Promise<DiagnosisResult> {
-  const key = process.env.OPENAI_API_KEY;
-  const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  const model = process.env.AI_MODEL || "gpt-4o";
-  const { category, text, imageDataUrl } = params;
-  if (!key) return offlineDiagnose(category, text);
+// --- OpenAI-compatible client (OpenAI, Gemini, Groq, vLLM, va h.k.) ---
+// Tashxis (chat/vision) OPENAI_* envlardan, ovoz (STT) esa STT_* envlardan
+// o'qiydi; STT_* berilmagan bo'lsa OPENAI_* ga tushadi.
+const clientCache = new Map<string, OpenAI>();
 
+function makeClient(name: string, key: string | undefined, baseUrl: string | undefined): OpenAI | null {
+  const trimmed = key?.trim();
+  if (!trimmed) return null;
+  const cached = clientCache.get(name);
+  if (cached) return cached;
+  const client = new OpenAI({
+    apiKey: trimmed,
+    baseURL: baseUrl?.trim() ? baseUrl.trim().replace(/\/$/, "") : undefined,
+    timeout: 50_000,
+    maxRetries: 2,
+  });
+  clientCache.set(name, client);
+  return client;
+}
+
+function getClient(): OpenAI | null {
+  return makeClient("chat", process.env.OPENAI_API_KEY, process.env.OPENAI_BASE_URL);
+}
+
+function getSttClient(): OpenAI | null {
+  const key = process.env.STT_API_KEY || process.env.OPENAI_API_KEY;
+  const baseUrl = process.env.STT_BASE_URL || process.env.OPENAI_BASE_URL;
+  return makeClient("stt", key, baseUrl);
+}
+
+function getModel(): string {
+  return process.env.AI_MODEL?.trim() || "gpt-4o";
+}
+
+// Model markdown kod bloki ichiga solib qo'ysa ham JSON ni topib oladi.
+function extractJson(raw: string): Partial<DiagnosisResult> | null {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed) as Partial<DiagnosisResult>;
+  } catch {
+    // continue
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced?.[1]) {
+    try {
+      return JSON.parse(fenced[1].trim()) as Partial<DiagnosisResult>;
+    } catch {
+      // continue
+    }
+  }
+  const brace = trimmed.match(/\{[\s\S]*\}/);
+  if (brace) {
+    try {
+      return JSON.parse(brace[0]) as Partial<DiagnosisResult>;
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
+type ChatMessage = OpenAI.ChatCompletionMessageParam;
+
+function buildMessages(category: "crop" | "animal", text: string, imageDataUrl?: string | null): ChatMessage[] {
   const subject = category === "crop" ? "Ekin (o'simlik)" : "Hayvon (chorva)";
-  const content: Record<string, unknown>[] = [
+  const content: OpenAI.ChatCompletionContentPart[] = [
     {
       type: "text",
       text: `Bo'lim: ${subject}. Foydalanuvchi tavsifi: ${text || "(matn berilmadi, faqat rasm)"}`,
@@ -161,31 +216,46 @@ export async function aiDiagnose(params: {
   if (imageDataUrl) {
     content.push({ type: "image_url", image_url: { url: imageDataUrl } });
   }
+  return [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content },
+  ];
+}
 
+async function requestDiagnosis(messages: ChatMessage[], useJsonMode: boolean): Promise<string> {
+  const client = getClient();
+  if (!client) throw new Error("AI kaliti sozlanmagan");
+  const res = await client.chat.completions.create({
+    model: getModel(),
+    ...(useJsonMode ? { response_format: { type: "json_object" as const } } : {}),
+    messages,
+    max_tokens: 700,
+  });
+  return res.choices?.[0]?.message?.content ?? "";
+}
+
+export async function aiDiagnose(params: {
+  category: "crop" | "animal";
+  text: string;
+  imageDataUrl?: string | null;
+}): Promise<DiagnosisResult> {
+  const { category, text, imageDataUrl } = params;
+  const client = getClient();
+  if (!client) return offlineDiagnose(category, text);
+
+  const messages = buildMessages(category, text, imageDataUrl);
+
+  let raw = "";
   try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content },
-        ],
-        max_tokens: 700,
-      }),
-    });
-    if (!res.ok) throw new Error(`OpenAI ${res.status}`);
-    const json = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
-    };
-    const raw = json.choices?.[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw) as Partial<DiagnosisResult>;
-    if (!parsed.disease) throw new Error("bo'sh javob");
+    // Avval JSON rejimida sinab ko'ramiz; ba'zi open-source serverlar
+    // (vLLM va h.k.) buni qo'llab-quvvatlamasa, oddiy rejimda qayta urinamiz.
+    try {
+      raw = await requestDiagnosis(messages, true);
+    } catch {
+      raw = await requestDiagnosis(messages, false);
+    }
+    const parsed = extractJson(raw);
+    if (!parsed?.disease) throw new Error("AI javobida kasallik nomi yo'q");
     return {
       disease: String(parsed.disease),
       solution: String(parsed.solution ?? ""),
@@ -200,19 +270,20 @@ export async function aiDiagnose(params: {
 }
 
 export async function transcribeAudio(file: Blob): Promise<string> {
-  const key = process.env.OPENAI_API_KEY;
-  const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  if (!key) return "";
-  const form = new FormData();
-  form.append("file", file, "audio.webm");
-  form.append("model", process.env.ASR_MODEL || "whisper-1");
-  form.append("language", "uz");
-  const res = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}` },
-    body: form,
-  });
-  if (!res.ok) return "";
-  const json = (await res.json()) as { text?: string };
-  return json.text ?? "";
+  const client = getSttClient();
+  if (!client) return "";
+  try {
+    const isOgg = (file.type || "").includes("ogg");
+    const audioFile = new File([file], isOgg ? "audio.ogg" : "audio.webm", {
+      type: file.type || (isOgg ? "audio/ogg" : "audio/webm"),
+    });
+    const res = await client.audio.transcriptions.create({
+      file: audioFile,
+      model: process.env.STT_MODEL?.trim() || process.env.ASR_MODEL?.trim() || "whisper-1",
+      language: "uz",
+    });
+    return res.text ?? "";
+  } catch {
+    return "";
+  }
 }

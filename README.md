@@ -86,6 +86,8 @@ Telegram ichida ochilganda app mobil Mini App ko'rinishida ishlaydi. Oddiy brows
 
 ## Tavsiya Qilingan Open-Source AI
 
+> AI rasmiy `openai` SDK'si orqali ulanadi (`npm install openai`). Sozlash va provayder variantlari (OpenAI, Gemini, OpenRouter, vLLM) uchun `docs/AI_SETUP.md` faylini ko'ring.
+
 MVP uchun:
 
 - `Qwen/Qwen2.5-VL-7B-Instruct` - rasm + matn tashxis uchun eng yaxshi balans.

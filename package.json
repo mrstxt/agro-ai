@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:push": "drizzle-kit push"
+    "db:push": "drizzle-kit push",
+    "bot:setup": "sh ./scripts/setup-telegram-webhook.sh",
+    "bot:webhook": "sh ./scripts/setup-telegram-webhook.sh"
   },
   "dependencies": {
     "@types/leaflet": "^1.9.22",
@@ -19,6 +21,7 @@
     "leaflet": "^1.9.4",
     "lucide-react": "^1.45.0",
     "next": "16.2.6",
+    "openai": "^4.104.0",
     "pg": "8.20.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
